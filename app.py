@@ -7,8 +7,8 @@ from modules.social_media_insight import generate_social_media_insight
 app = Flask(__name__)
 swagger = Swagger(app)
 
-allowed_origins = ["http://localhost:5173", "https://orusapp.netlify.app"]
-CORS(app, resources={r"/*": {"origins": allowed_origins}})
+allowed_origins = ["http://localhost:5173"]
+CORS(app, resources={r"/*": {"origins": allowed_origins}}, supports_credentials=True)
 
 
 @app.route("/")
