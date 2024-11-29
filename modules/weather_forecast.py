@@ -1,334 +1,289 @@
 import requests
-import tensorflow as tf
-import numpy as np
 import pandas as pd
-from datetime import date, timedelta
+import numpy as np
+from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-url = os.getenv("API_URL")
-token = os.getenv("HUGGINGFACE_TOKEN")
+api_google_genai = os.getenv("API_GOOGLE_GENAI_WF")
 
-parameter_names = {
-    "RH2M": "Relative Humidity at 2m",
-    "ALLSKY_SFC_SW_DWN": "Surface Shortwave Downward Irradiance",
-    "T2M": "Temperature at 2m (°C)",
+
+def fetch_data(api_url_base, latitude, longitude):
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=48 * 30)
+    start_str = start_date.strftime("%Y%m%d")
+    end_str = end_date.strftime("%Y%m%d")
+
+    api_url = f"{api_url_base}?latitude={latitude}&longitude={longitude}&parameters=PRECTOTCORR,EVPTRNS,GWETROOT,GWETTOP,T2M,ALLSKY_SFC_SW_DWN,ALLSKY_SFC_SW_DIFF,CLRSKY_SFC_SW_DNI,WS10M,CLRSKY_DAYS,CLRSKY_KT&format=JSON&start={start_str}&end={end_str}&community=AG"
+
+    response = requests.get(api_url)
+    if response.status_code != 200:
+        raise ValueError(
+            f"Failed to fetch data from API. Status code: {response.status_code}"
+        )
+
+    data = response.json()
+    parameters = data["properties"]["parameter"]
+
+    parameter_dfs = {}
+    for parameter, values in parameters.items():
+        df = pd.DataFrame(list(values.items()), columns=["date", parameter])
+        df["date"] = pd.to_datetime(df["date"], format="%Y%m%d")
+        parameter_dfs[parameter] = df
+
+    return parameter_dfs
+
+
+def clean_and_analyze_t2m_data(df):
+    invalid_values = {-999, -9999, -999.0, -9999.0}
+
+    df["is_valid"] = ~df["t2m"].isin(invalid_values)
+
+    monthly_data = (
+        df.groupby(df["date"].dt.to_period("M"))
+        .agg(
+            monthly_avg=("t2m", lambda x: x[x.isin(invalid_values) == False].mean()),
+            valid_days=("is_valid", "sum"),
+            total_days=("is_valid", "count"),
+        )
+        .reset_index()
+    )
+
+    monthly_data = monthly_data[
+        monthly_data["valid_days"] >= 0.5 * monthly_data["total_days"]
+    ]
+
+    if monthly_data["monthly_avg"].isna().any():
+        print("Warning: NaN detected in monthly averages, filling with safe defaults.")
+    monthly_data["monthly_avg"] = monthly_data["monthly_avg"].fillna(
+        0
+    )  # Replace NaN with 0
+
+    monthly_data["trend"] = (
+        monthly_data["monthly_avg"].diff().fillna(0)
+    )  # Replace NaN trends with 0
+
+    return monthly_data
+
+
+def calculate_monthly_trends(monthly_data):
+    monthly_data["month"] = monthly_data["date"].dt.month
+    monthly_data["pct_change"] = monthly_data["monthly_avg"].pct_change()
+    avg_trends = monthly_data.groupby("month")["pct_change"].mean().fillna(0).to_dict()
+    return avg_trends
+
+
+def forecast_with_trends(monthly_data, num_months=4):
+    avg_trends = calculate_monthly_trends(monthly_data)
+
+    avg_trends = {
+        month: (trend if not pd.isna(trend) else 0)
+        for month, trend in avg_trends.items()
+    }
+
+    last_avg = monthly_data["monthly_avg"].iloc[-1]
+    if pd.isna(last_avg):
+        print("Warning: Last average is NaN, setting to 0.")
+        last_avg = 0
+
+    forecasts = []
+
+    for i in range(num_months):
+        next_month = (monthly_data["month"].iloc[-1] + i + 1) % 12 or 12
+        trend_factor = 1 + avg_trends.get(next_month, 0)
+        if pd.isna(trend_factor):
+            print(f"Warning: Trend factor is NaN for month {next_month}, setting to 1.")
+            trend_factor = 1
+        next_avg = last_avg * trend_factor if last_avg != 0 else 0
+        forecasts.append(next_avg)
+        last_avg = next_avg
+
+    return forecasts
+
+
+def forecast_all_parameters_simple(api_url_base, latitude, longitude):
+    parameter_dfs = fetch_data(api_url_base, latitude, longitude)
+    forecasts = {}
+    for parameter, df in parameter_dfs.items():
+        monthly_data = clean_and_analyze_t2m_data(df.rename(columns={parameter: "t2m"}))
+        forecasted_values = forecast_with_trends(monthly_data)
+        forecasts[parameter] = forecasted_values
+    return forecasts
+
+
+def calculate_water_cost_trend(forecasts):
+    trend = []
+    for i in range(4):
+        deficit = forecasts["PRECTOTCORR"][i] - forecasts["EVPTRNS"][i]
+        humidity_variation = forecasts["GWETROOT"][i] - forecasts["GWETTOP"][i]
+        climate_impact = forecasts["T2M"][i]
+        value = 0.5 * deficit + 0.3 * humidity_variation + 0.2 * climate_impact
+        trend.append(value)
+    return trend
+
+
+def calculate_solar_energy_efficiency(forecasts):
+    efficiency = []
+    for i in range(4):
+        value = (
+            0.5 * forecasts["ALLSKY_SFC_SW_DWN"][i]
+            + 0.3 * forecasts["ALLSKY_SFC_SW_DIFF"][i]
+            + 0.2 * forecasts["CLRSKY_SFC_SW_DNI"][i]
+        )
+        efficiency.append(value)
+    return efficiency
+
+
+def calculate_climate_risk_trend(forecasts):
+    risk = []
+    for i in range(4):
+        value = (
+            0.4 * forecasts["PRECTOTCORR"][i]
+            + 0.3 * forecasts["ALLSKY_SFC_SW_DWN"][i]
+            + 0.3 * forecasts["WS10M"][i]
+        )
+        risk.append(value)
+    return risk
+
+
+analysis_type_map = {
+    "Water Cost Trend": "Tendência do Custo Hídrico",
+    "Solar Energy Efficiency": "Eficiência Energética Solar",
+    "Infrastructure Climate Risk Trend": "Tendência de Risco Climático para Infraestruturas",
+    "Air Quality Forecast": "Previsão da Qualidade do Ar",
 }
 
 
-def format_date_to_api(date_input):
-    return date_input.strftime("%Y%m%d")
-
-
-def fetch_nasa_power_data(latitude, longitude, start_date, end_date):
-    parameters = "RH2M,ALLSKY_SFC_SW_DWN,T2M"
-    format_type = "JSON"
-    api_power_url = f"https://power.larc.nasa.gov/api/temporal/daily/point?latitude={latitude}&longitude={longitude}&parameters={parameters}&format={format_type}&start={start_date}&end={end_date}&community=AG"
-    response_power = requests.get(api_power_url)
-
-    if response_power.status_code == 200:
-        return response_power.json()["properties"]["parameter"]
-    else:
-        raise Exception(
-            f"Error fetching data from NASA POWER API: {response_power.status_code}"
+def calculate_air_quality_forecast(forecasts):
+    air_quality = []
+    for i in range(4):
+        value = (
+            0.4 * forecasts["CLRSKY_DAYS"][i]
+            + 0.3 * forecasts["ALLSKY_SFC_SW_DIFF"][i]
+            + 0.3 * forecasts["CLRSKY_KT"][i]
         )
+        air_quality.append(value)
+    return air_quality
 
 
-def llm3(query):
-    parameters = {
-        "max_new_tokens": 100,
-        "temperature": 0.1,
-        "top_k": 50,
-        "top_p": 0.95,
-        "return_full_text": False,
+def calculate_topic_forecasts_with_text(parameter_forecasts):
+    return {
+        "Water Cost Trend": calculate_water_cost_trend(parameter_forecasts),
+        "Solar Energy Efficiency": calculate_solar_energy_efficiency(
+            parameter_forecasts
+        ),
+        "Infrastructure Climate Risk Trend": calculate_climate_risk_trend(
+            parameter_forecasts
+        ),
+        "Air Quality Forecast": calculate_air_quality_forecast(parameter_forecasts),
     }
 
-    prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>You are a helpful and smart assistant. You accurately provide answer to the provided user query.<|eot_id|><|start_header_id|>user<|end_header_id|> Here is the query: ```{query}```.
-      Provide precise and concise answer. Provide only in plain text, no special characters.<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
 
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-    prompt = prompt.replace("{query}", query)
-
-    payload = {"inputs": prompt, "parameters": parameters}
-
-    response = requests.post(url, headers=headers, json=payload)
-    response_text = response.json()[0]["generated_text"].strip()
-
-    return response_text
+def fix_infinite_values(data):
+    for i in range(len(data)):
+        if data[i] == -float("inf"):
+            if i > 0:
+                data[i] = data[i - 1] * 1.2
+            else:
+                data[i] = 0
+    return data
 
 
-def llm2(query):
-    parameters = {
-        "max_new_tokens": 100,
-        "temperature": 0.7,
-        "top_k": 50,
-        "top_p": 0.95,
-        "return_full_text": False,
-    }
+def llm_generate_insight(
+    analysis_type,
+    forecast_values,
+    business_type,
+    location,
+    search_objective,
+    main_problems,
+):
+    import google.generativeai as genai
 
-    prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>You are a helpful and smart assistant. You accurately provide answer to the provided user query.<|eot_id|><|start_header_id|>user<|end_header_id|> Here is the query: ```{query}```.
-      Provide precise and concise answer.<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
-
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-    prompt = prompt.replace("{query}", query)
-
-    payload = {"inputs": prompt, "parameters": parameters}
-
-    response = requests.post(url, headers=headers, json=payload)
-    response_text = response.json()[0]["generated_text"].strip()
-
-    return response_text
-
-
-def llm(query):
-    parameters = {
-        "max_new_tokens": 100,
-        "temperature": 0.002,
-        "top_k": 50,
-        "top_p": 0.95,
-        "return_full_text": False,
-    }
-
-    prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>You are a helpful and smart assistant. You accurately provide answer to the provided user query.<|eot_id|><|start_header_id|>user<|end_header_id|> Here is the query: ```{query}```.
-      Provide precise and concise answer.<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
-
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-    prompt = prompt.replace("{query}", query)
-
-    payload = {"inputs": prompt, "parameters": parameters}
-
-    response = requests.post(url, headers=headers, json=payload)
-    response_text = response.json()[0]["generated_text"].strip()
-
-    return response_text
-
-
-def generate_dynamic_title(insight):
-    prompt = """Generate a single 2-3 word title that summarizes this agricultural recommendation:
-    '{insight}'
-    Return ONLY the title, no quotes, no formatting, no explanation."""
-
-    try:
-        response = llm(prompt.format(insight=insight))
-        cleaned_title = response.split("\n")[0].strip().strip("\"'")
-        words = cleaned_title.split()[:3]
-        return " ".join(words)
-    except Exception as e:
-        return "Recommendation"
-
-
-def predict_parameter_value(historical_data, parameter_name, target_date, location):
-    prompt = f"""You are a weather prediction system. Return ONLY a single number.
-
-Historical {parameter_names[parameter_name]} 
-Location: {location['latitude']}, {location['longitude']}
-Target: {target_date}
-
-if the value is -999, its because we dont have the value.
-
-Rules for {parameter_name}:
-T2M: between -50 and 60
-RH2M: between 0 and 100
-ALLSKY_SFC_SW_DWN: between 0 and 100
-
-RH2M = Relative Humidity at 2m,
-ALLSKY_SFC_SW_DWN = Surface Shortwave Downward Irradiance,
-T2M = Temperature at 2m (°C)
-
-Return ONLY the predicted number. No text, no units, no explanation.
-Example good response format for T2M: '24.5'
-Example bad response format for T2M: 'The temperature will be 24.5 degrees
-Example good response format for RH2M: '57.5'
-Example bad response format for RH2M: 'The temperature will be 57.5
-Example good response format for ALLSKY_SFC_SW_DWN: '24.5'
-Example bad response format for ALLSKY_SFC_SW_DWN: 'The temperature will be 24.5 
-
-
-'
-
-values: {historical_data[-30:]}"""
-
-    try:
-        response = llm(
-            prompt.format(
-                prompt.format(
-                    historical_data=historical_data,
-                    parameter_name=parameter_name,
-                    target_date=target_date,
-                    location=location,
-                )
-            )
-        ).strip()
-        return response
-    except Exception as e:
-        print(f"Error predicting value for {parameter_name}: {str(e)}")
-        defaults = {
-            "T2M": 25.0,
-            "RH2M": 50.0,
-            "ALLSKY_SFC_SW_DWN": 500.0,
-        }
-        return defaults.get(parameter_name, 0.0)
-
-    except Exception as e:
-        print(f"Error predicting value for {parameter_name}: {str(e)}")
-        defaults = {
-            "T2M": 25.0,
-            "RH2M": 50.0,
-            "ALLSKY_SFC_SW_DWN": 500.0,
-        }
-        return defaults.get(parameter_name, 0.0)
-
-
-def generate_daily_insights(date, crop_info, location, predicted_values):
     prompt = f"""
-    Date: {date}
-    Location: Latitude {location['latitude']}, Longitude {location['longitude']}
-    Crop: {crop_info['crop'][0]}
-    Field Size: {crop_info['size_h']}
+    Me ajude a ter alguns insights. A seguir, irei te passar alguns parâmetros da minha empresa e objetos
+    Para {analysis_type}, eu sei que os próximos 4 meses terão as seguintes médias de tendência na variação
+    {forecast_values}
+    Minha empresa é do ramo: {business_type}
+    Pense com base na minha localização Latitude {location['latitude']}, Longitude {location['longitude']}
+    Meu objetivo de busca é: {search_objective}
+    Os principais problemas de negócio que possuo são: {main_problems}
 
-    Predicted conditions for this day:
-    {', '.join([f"{parameter_names[param]}: {value}" for param, value in predicted_values.items()])}
-
-    Based on these predictions, Consider:
-    Supervision needs, Temperature management, Root moisture conditions, Possible critical actions, Possible pests of the crop in question, the time of year we are in according to the date, specific points of the person's crop and the person's location (city, state and country, according to latitude and longitude)
-    Consider: water-related challenges due to unpredictable weather, pests, and diseases
-    Consider: water-related challenges due to unpredictable weather, pests, and diseases
-    Consider: water-related challenges due to unpredictable weather, pests, and diseases
-
-    provide specific agricultural recommendations for this day in 2 sentences on plain text.
-
-    Be direct and objective in the suggestions.
-    Do not use the first person
-    Your response must be in 200 characters or less.
-    Dont write special characters, such as *, \n or \n\n 
-    write on the third person 
-    Give me only the 2 sentences recommendations
-    """
-    return llm3(
-        prompt.format(
-            date=date,
-            crop_info=crop_info,
-            location=location,
-            predicted_values=predicted_values,
-        )
+    Poderia me dar um insight ou recomendação de qual ação devo tomar, com base nos meus problemas, objetivos e todo o contexto? claro e objetivo com até 200 caracteres, priorizando informações úteis e acionáveis.
+    Por favor, me responda em 2 frases apenas."""
+    genai.configure(api_key=api_google_genai)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    response = model.generate_content(prompt)
+    resposta = (
+        response.text.replace("Resposta:", "")
+        .replace("\n", " ")
+        .replace("/", "")
+        .strip()
     )
-
-
-def determine_status(predicted_values):
-    try:
-        if any(
-            predicted_values.get(key) is None
-            for key in ["RH2M", "ALLSKY_SFC_SW_DWN", "T2M"]
-        ):
-            return "Normal"
-        if predicted_values["T2M"] > 35 and predicted_values["RH2M"] < 30:
-            return "Extreme dry heat"
-        elif predicted_values["T2M"] > 35 and predicted_values["RH2M"] > 80:
-            return "Extreme humid heat"
-        elif predicted_values["T2M"] < 10:
-            return "Extreme cold"
-
-        elif (
-            predicted_values["RH2M"] < 30
-            and predicted_values["ALLSKY_SFC_SW_DWN"] > 800
-        ):
-            return "High evaporation"
-        elif predicted_values["RH2M"] < 20:
-            return "Critical low humidity"
-
-        elif predicted_values["RH2M"] > 85 and predicted_values["T2M"] > 25:
-            return "Risk of fungal diseases"
-
-        elif predicted_values["ALLSKY_SFC_SW_DWN"] > 900:
-            return "High solar radiation"
-
-        elif 30 <= predicted_values["T2M"] <= 35:
-            return "Moderate heat"
-        elif predicted_values["RH2M"] < 40:
-            return "Low humidity"
-        elif predicted_values["RH2M"] > 80:
-            return "High humidity"
-        else:
-            return "Normal"
-    except (KeyError, TypeError):
-        return "Normal"
-
-
-def select_lucide_icon(title, description):
-    prompt = """Based on the title and description, you should suggest, according to the lucide icons library, a single icon that best fits the context.
-Below are some icon names from the "weather" class, but you can choose any other, as long as it is part of the lucide icons library:
-cloud, cloud-drizzle, cloud-fog, cloud-hail, cloud-lightning, cloud-moon, cloud-moon-rain, cloud-off, cloud-rain, cloud-rain-wind, cloud-rain-wind, cloud-sun, cloud-sun-rain, cloudy, haze, moon-star, rainbow, snowflake, sparkles, star, sun, sun-dim, sun-medium, sun-snow, sunrise, sunset, thermometer, thermometer-snowflake, umbrella-off, waves, wind, zap, zap-off
-
-return only the name of the icon.
-Illustrative example of a good answer: wind
-Illustrative example of a bad answer: The icon that best fits the context would be wind
-
-Title: {title}
-Description: {description}"""
-
-    try:
-        response = llm(prompt.format(title=title, description=description))
-        icon_name = response.strip().split("\n")[0].strip()
-        return icon_name
-    except Exception as e:
-        print(f"Error selecting icon: {str(e)}")
-        return "sun"
+    return resposta
 
 
 def process_weather_forecast(input_json):
-    crop = input_json["crop"]
-    size = input_json["size"]
-    location = input_json["location"]
+    api_url_base = "https://power.larc.nasa.gov/api/temporal/daily/point"
+    latitude = input_json["location"]["latitude"]
+    longitude = input_json["location"]["longitude"]
+    business_name = input_json["business_name"]
+    business_type = input_json["business_type"]
+    user_analysis_types = input_json["analysis_type"]
+    search_objective = input_json["search_objective"]
+    main_problems = input_json["main_problems"]
 
-    end_date = date.today()
-    start_date = end_date - timedelta(days=30)
-
-    data = fetch_nasa_power_data(
-        location["latitude"],
-        location["longitude"],
-        format_date_to_api(start_date),
-        format_date_to_api(end_date),
+    parameter_forecasts = forecast_all_parameters_simple(
+        api_url_base, latitude, longitude
     )
+    topic_forecasts = calculate_topic_forecasts_with_text(parameter_forecasts)
 
-    df = pd.DataFrame(
-        {param: list(data[param].values()) for param in parameter_names.keys()}
-    )
+    filtered_forecasts = {
+        analysis_type_map[key]: fix_infinite_values(value)
+        for key, value in topic_forecasts.items()
+        if analysis_type_map[key] in user_analysis_types
+    }
 
-    output_json = {"state": "Nome", "plantation": crop[0], "days": []}
+    output = {
+        "business_name": business_name,
+        "business_type": business_type,
+        "insights": [],
+    }
 
-    for day_offset in range(3):
-        target_date = end_date + timedelta(days=day_offset)
-
-        predicted_values = {}
-        for parameter in parameter_names.keys():
-            historical_values = df[parameter].tolist()
-            predicted_value = predict_parameter_value(
-                historical_values, parameter, target_date, location
-            )
-            predicted_values[parameter] = predicted_value
-
-        insights = generate_daily_insights(
-            target_date, {"crop": crop, "size_h": size}, location, predicted_values
+    for user_type, forecast_values in filtered_forecasts.items():
+        graph_data = generate_graph_data(forecast_values, user_type)
+        insight_tip = llm_generate_insight(
+            analysis_type=user_type,
+            forecast_values=forecast_values,
+            business_type=business_type,
+            location={"latitude": latitude, "longitude": longitude},
+            search_objective=search_objective,
+            main_problems=main_problems,
+        )
+        output["insights"].append(
+            {
+                "analysis_type": user_type,
+                "graph_data": graph_data,
+                "insight_tip": insight_tip,
+            }
         )
 
-        status = determine_status(predicted_values)
-        title = generate_dynamic_title(insights)
+    return output
 
-        icon = select_lucide_icon(title, insights)
 
-        day_entry = {
-            "icon": icon,
-            "data": target_date.strftime("%d.%b."),
-            "status": status,
-            "duracao": f"{start_date.strftime('%Y-%m-%d')} a {end_date.strftime('%Y-%m-%d')}",
-            "dicks": [{"title": title, "icon": icon, "description": insights}],
-        }
-
-        output_json["days"].append(day_entry)
-
-    return output_json
+def generate_graph_data(forecast_values, analysis_type):
+    labels = ["January", "February", "March", "April"]
+    label_map = {
+        "Tendência do Custo Hídrico": "Tendência do Custo Hídrico",
+        "Eficiência Energética Solar": "Eficiência Energética Solar",
+        "Tendência de Risco Climático para Infraestruturas": "Infrastructure Climate Risk Trend",
+        "Previsão da Qualidade do Ar": "Previsão da Qualidade do Ar",
+    }
+    return {
+        "labels": labels,
+        "datasets": {
+            "label": label_map.get(analysis_type, analysis_type),
+            "data": forecast_values,
+        },
+    }
