@@ -7,7 +7,10 @@ from modules.social_media_insight import generate_social_media_insight
 app = Flask(__name__)
 swagger = Swagger(app)
 
-allowed_origins = ["http://localhost:5173"]
+allowed_origins = [
+    "http://localhost:5173",
+    "https://hacka-cbs-2024-backend.onrender.com",
+]
 CORS(app, resources={r"/*": {"origins": allowed_origins}}, supports_credentials=True)
 
 
