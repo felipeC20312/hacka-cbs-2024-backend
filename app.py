@@ -9,7 +9,7 @@ swagger = Swagger(app)
 
 allowed_origins = [
     "http://localhost:5173",
-    "https://hacka-cbs-2024-backend.onrender.com",
+    "https://copernicoai.netlify.app",
 ]
 CORS(app, resources={r"/*": {"origins": allowed_origins}}, supports_credentials=True)
 
